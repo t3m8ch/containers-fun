@@ -13,18 +13,63 @@ use nix::{
     sys::wait::waitpid,
     unistd::{ForkResult, chdir, execve, fork, getgid, getuid, pivot_root, sethostname},
 };
+use zbus::{
+    proxy,
+    zvariant::{OwnedObjectPath, Value},
+};
 
-async fn spawn_process(cmd: &str, root_fs: &str) -> Result<i32, Box<dyn std::error::Error>> {
+pub struct ResourceLimits {
+    pub memory_max: Option<u64>,        // в байтах
+    pub cpu_quota_per_sec: Option<u64>, // в микросекундах
+    pub pids_max: Option<u64>,          // максимальное количество процессов
+}
+
+#[proxy(
+    interface = "org.freedesktop.systemd1.Manager",
+    gen_blocking = false,
+    default_service = "org.freedesktop.systemd1",
+    default_path = "/org/freedesktop/systemd1"
+)]
+trait SystemdManager {
+    #[zbus(name = "StartTransientUnit")]
+    async fn start_transient_unit(
+        &self,
+        name: &str,
+        mode: &str,
+        properties: &[(&str, Value<'_>)],
+        aux: &[(&str, &[(&str, Value<'_>)])],
+    ) -> zbus::Result<OwnedObjectPath>;
+}
+
+async fn spawn_process<'a>(
+    cmd: &str,
+    root_fs: &str,
+    systemd_manager: &SystemdManagerProxy<'a>,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let root_fs = path::absolute(root_fs)?
         .to_str()
         .map(|p| p.to_string())
         .ok_or("Invalid root filesystem path")?;
 
     let (psock_wait_user_namespace, csock_wait_user_namespace) = create_sync_channel()?;
+    let (psock_wait_cgroups, csock_wait_cgroups) = create_sync_channel()?;
 
     match unsafe { fork()? } {
         ForkResult::Parent { child } => {
             println!("It's parent. Child pid: {}", child);
+
+            create_cgroups_scope(
+                child.as_raw().to_string().as_str(),
+                child.as_raw(),
+                &ResourceLimits {
+                    memory_max: None,
+                    cpu_quota_per_sec: None,
+                    pids_max: None,
+                },
+                systemd_manager,
+            )
+            .await?;
+            send_signal(&psock_wait_cgroups)?;
 
             // TODO: Make this function async
             wait_for_signal(psock_wait_user_namespace)?;
@@ -36,6 +81,7 @@ async fn spawn_process(cmd: &str, root_fs: &str) -> Result<i32, Box<dyn std::err
         }
         ForkResult::Child => {
             println!("It's child!");
+            wait_for_signal(csock_wait_cgroups)?;
 
             unshare(CloneFlags::CLONE_NEWUSER)?;
             send_signal(&csock_wait_user_namespace)?;
@@ -70,6 +116,41 @@ async fn spawn_process(cmd: &str, root_fs: &str) -> Result<i32, Box<dyn std::err
             Ok(0)
         }
     }
+}
+
+async fn create_cgroups_scope<'a>(
+    container_id: &str,
+    pid: i32,
+    limits: &ResourceLimits,
+    systemd_manager: &SystemdManagerProxy<'a>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let scope_name = format!("container-{}.scope", container_id);
+
+    let props = [
+        Some(("Delegate", true.into())),
+        Some(("PIDs", vec![pid as u32].into())),
+        limits
+            .memory_max
+            .map(|memory_max| ("MemoryMax", memory_max.into())),
+        limits
+            .cpu_quota_per_sec
+            .map(|cpu_quota| ("CPUQuotaPerSecUSec", cpu_quota.into())),
+        limits
+            .pids_max
+            .map(|pids_max| ("TasksMax", pids_max.into())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let job_path = systemd_manager
+        .start_transient_unit(&scope_name, "fail", &props, &[])
+        .await?;
+
+    println!("✓ Создан scope '{}' для контейнера", scope_name);
+    println!("  Job path: {}", job_path);
+
+    Ok(scope_name)
 }
 
 fn setup_id_mapping(child_pid: i32) -> Result<(), Box<dyn std::error::Error>> {
@@ -245,7 +326,10 @@ fn execute_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() {
-    spawn_process("/bin/busybox ls /rootfs", "./rootfs")
+    let zbus_conn = zbus::Connection::session().await.unwrap();
+    let systemd_manager = SystemdManagerProxy::new(&zbus_conn).await.unwrap();
+
+    spawn_process("/bin/busybox ls /rootfs", "./rootfs", &systemd_manager)
         .await
         .unwrap();
 }
