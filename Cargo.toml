@@ -1,0 +1,17 @@
+[package]
+name = "containers-fun"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-pidfd = "0.1.5"
+cgroups-rs = "0.3.4"
+nix = { version = "0.30.1", features = [
+    "process",
+    "sched",
+    "user",
+    "mount",
+    "fs",
+    "hostname",
+] }
+tokio = { version = "1.46.1", features = ["full"] }
