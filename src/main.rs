@@ -1,3 +1,4 @@
+use futures_util::stream::StreamExt;
 use std::{
     env,
     ffi::CString,
@@ -41,6 +42,15 @@ trait SystemdManager {
         properties: &[(&str, Value<'_>)],
         aux: &[(&str, &[(&str, Value<'_>)])],
     ) -> zbus::Result<OwnedObjectPath>;
+
+    #[zbus(signal)]
+    async fn job_removed(
+        &self,
+        id: u32,
+        job: OwnedObjectPath,
+        unit: String,
+        result: String,
+    ) -> zbus::Result<()>;
 }
 
 async fn spawn_process<'a>(
@@ -152,12 +162,47 @@ async fn create_cgroups_scope<'a>(
     .flatten()
     .collect::<Vec<_>>();
 
+    let mut job_removed_stream = systemd_manager.receive_job_removed().await?;
+
     let job_path = systemd_manager
         .start_transient_unit(&scope_name, "fail", &props, &[])
         .await?;
 
-    println!("✓ Создан scope '{}' для контейнера", scope_name);
+    println!("✓ Запущен job для создания scope '{}'", scope_name);
     println!("  Job path: {}", job_path);
+
+    while let Some(msg) = job_removed_stream.next().await {
+        let args = msg.args()?;
+        if args.unit == scope_name {
+            match args.result.as_str() {
+                "done" => {
+                    println!(
+                        "✓ Scope '{}' успешно создан и процесс перемещён",
+                        scope_name
+                    );
+                    break;
+                }
+                "failed" => {
+                    return Err(
+                        format!("Ошибка создания scope '{}': job failed", scope_name).into(),
+                    );
+                }
+                "timeout" => {
+                    return Err(format!("Ошибка создания scope '{}': timeout", scope_name).into());
+                }
+                "canceled" => {
+                    return Err(format!("Создание scope '{}' было отменено", scope_name).into());
+                }
+                _ => {
+                    return Err(format!(
+                        "Неожиданный результат job для scope '{}': {}",
+                        scope_name, args.result
+                    )
+                    .into());
+                }
+            }
+        }
+    }
 
     Ok(scope_name)
 }
