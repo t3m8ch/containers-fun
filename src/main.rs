@@ -1,4 +1,5 @@
 use std::{
+    env,
     ffi::CString,
     fs,
     io::{Read, Write},
@@ -7,6 +8,7 @@ use std::{
 };
 
 use async_pidfd::AsyncPidFd;
+use itertools::Itertools;
 use nix::{
     mount::{MntFlags, MsFlags, mount, umount2},
     sched::{CloneFlags, unshare},
@@ -326,10 +328,12 @@ fn execute_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() {
+    let cmd = env::args().skip(1).join(" ");
+
     let zbus_conn = zbus::Connection::session().await.unwrap();
     let systemd_manager = SystemdManagerProxy::new(&zbus_conn).await.unwrap();
 
-    spawn_process("/bin/busybox ls /rootfs", "./rootfs", &systemd_manager)
+    spawn_process(&cmd, "./rootfs", &systemd_manager)
         .await
         .unwrap();
 }
