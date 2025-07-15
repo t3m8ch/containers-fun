@@ -55,14 +55,22 @@ async fn spawn_process<'a>(
 
     let (psock_wait_user_namespace, csock_wait_user_namespace) = create_sync_channel()?;
     let (psock_wait_cgroups, csock_wait_cgroups) = create_sync_channel()?;
+    let (psock_grandchild_pid, csock_grandchild_pid) = create_sync_channel()?;
 
     match unsafe { fork()? } {
         ForkResult::Parent { child } => {
             println!("It's parent. Child pid: {}", child);
 
+            // TODO: Make this function async
+            wait_for_signal(psock_wait_user_namespace)?;
+            setup_id_mapping(child.as_raw())?;
+
+            let grandchild_pid = receive_grandchild_pid(psock_grandchild_pid)?;
+            println!("Received grandchild PID: {}", grandchild_pid);
+
             create_cgroups_scope(
-                child.as_raw().to_string().as_str(),
-                child.as_raw(),
+                grandchild_pid.to_string().as_str(),
+                grandchild_pid,
                 &ResourceLimits {
                     memory_max: None,
                     cpu_quota_per_sec: None,
@@ -73,17 +81,12 @@ async fn spawn_process<'a>(
             .await?;
             send_signal(&psock_wait_cgroups)?;
 
-            // TODO: Make this function async
-            wait_for_signal(psock_wait_user_namespace)?;
-            setup_id_mapping(child.as_raw())?;
-
             let pidfd = AsyncPidFd::from_pid(child.as_raw())?;
             let status = pidfd.wait().await?;
             Ok(status.status().code().unwrap_or(-1))
         }
         ForkResult::Child => {
             println!("It's child!");
-            wait_for_signal(csock_wait_cgroups)?;
 
             unshare(CloneFlags::CLONE_NEWUSER)?;
             send_signal(&csock_wait_user_namespace)?;
@@ -97,6 +100,8 @@ async fn spawn_process<'a>(
 
             match unsafe { fork()? } {
                 ForkResult::Parent { child } => {
+                    println!("GRANDCHILD: {}", child);
+                    send_grandchild_pid(&csock_grandchild_pid, child.as_raw())?;
                     match waitpid(child, None) {
                         Ok(status) => {
                             println!("Child status: {:?}", status);
@@ -110,6 +115,8 @@ async fn spawn_process<'a>(
                 ForkResult::Child => {
                     setup_filesystem(&root_fs)?;
                     sethostname("coderunner")?;
+
+                    wait_for_signal(csock_wait_cgroups)?;
                     execute_command(cmd)?;
                 }
             };
@@ -232,6 +239,22 @@ fn send_signal(mut sock: &UnixStream) -> Result<(), Box<dyn std::error::Error>> 
     sock.write_all(&[1])?;
     println!("Signal sent");
     Ok(())
+}
+
+fn send_grandchild_pid(mut sock: &UnixStream, pid: i32) -> Result<(), Box<dyn std::error::Error>> {
+    let pid_bytes = pid.to_le_bytes();
+    sock.write_all(&pid_bytes)?;
+    println!("Sent grandchild PID: {}", pid);
+    Ok(())
+}
+
+fn receive_grandchild_pid(mut sock: UnixStream) -> Result<i32, Box<dyn std::error::Error>> {
+    let mut buf = [0u8; 4]; // i32 = 4 bytes
+    sock.set_read_timeout(None)?;
+    sock.read_exact(&mut buf)?;
+    let pid = i32::from_le_bytes(buf);
+    println!("Received grandchild PID: {}", pid);
+    Ok(pid)
 }
 
 fn setup_filesystem(root_fs: &str) -> Result<(), Box<dyn std::error::Error>> {
