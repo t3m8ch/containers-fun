@@ -56,6 +56,7 @@ trait SystemdManager {
 async fn spawn_process<'a>(
     cmd: &str,
     root_fs: &str,
+    mem_max: Option<u64>,
     systemd_manager: &SystemdManagerProxy<'a>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let root_fs = path::absolute(root_fs)?
@@ -82,7 +83,7 @@ async fn spawn_process<'a>(
                 grandchild_pid.to_string().as_str(),
                 grandchild_pid,
                 &ResourceLimits {
-                    memory_max: None,
+                    memory_max: mem_max,
                     cpu_quota_per_sec: None,
                     pids_max: None,
                 },
@@ -397,11 +398,14 @@ fn execute_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() {
     let cmd = env::args().skip(1).join(" ");
+    let mem_max = env::var("MEM_MAX")
+        .map(|m| str::parse::<u64>(&m).unwrap())
+        .ok();
 
     let zbus_conn = zbus::Connection::session().await.unwrap();
     let systemd_manager = SystemdManagerProxy::new(&zbus_conn).await.unwrap();
 
-    spawn_process(&cmd, "./rootfs", &systemd_manager)
+    spawn_process(&cmd, "./rootfs", mem_max, &systemd_manager)
         .await
         .unwrap();
 }
