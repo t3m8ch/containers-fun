@@ -15,8 +15,8 @@ use nix::{
     sched::{CloneFlags, unshare},
     sys::wait::waitpid,
     unistd::{
-        ForkResult, chdir, close, dup2_stderr, dup2_stdout, execve, fork, getgid, getuid, pipe,
-        pivot_root, read, sethostname,
+        ForkResult, Pid, chdir, close, dup2_stderr, dup2_stdout, execve, fork, getgid, getuid,
+        pipe, pivot_root, read, sethostname,
     },
 };
 use zbus::{
@@ -78,82 +78,146 @@ async fn spawn_process<'a>(
         ForkResult::Parent { child } => {
             println!("It's parent. Child pid: {}", child);
 
-            close(stdout_write)?;
-            close(stderr_write)?;
-
-            // TODO: Make this function async
-            wait_for_signal(psock_wait_user_namespace)?;
-            setup_id_mapping(child.as_raw())?;
-
-            let grandchild_pid = receive_grandchild_pid(psock_grandchild_pid)?;
-            println!("Received grandchild PID: {}", grandchild_pid);
-
-            create_cgroups_scope(
-                grandchild_pid.to_string().as_str(),
-                grandchild_pid,
+            parent(
+                child,
+                stdout_write,
+                stderr_write,
+                &stdout_read,
+                &stderr_read,
+                psock_wait_user_namespace,
+                psock_grandchild_pid,
+                psock_wait_cgroups,
                 limits,
                 systemd_manager,
             )
-            .await?;
-            send_signal(&psock_wait_cgroups)?;
-
-            let pidfd = AsyncPidFd::from_pid(child.as_raw())?;
-            let status = pidfd.wait().await?;
-
-            println!("stdout: {:?}", read_from_pipe(&stdout_read));
-            println!("stderr: {:?}", read_from_pipe(&stderr_read));
-            Ok(status.status().code().unwrap_or(-1))
+            .await
         }
         ForkResult::Child => {
             println!("It's child!");
 
-            unshare(CloneFlags::CLONE_NEWUSER)?;
-            send_signal(&csock_wait_user_namespace)?;
-            unshare(
-                CloneFlags::CLONE_NEWPID
-                    | CloneFlags::CLONE_NEWNS
-                    | CloneFlags::CLONE_NEWUTS
-                    | CloneFlags::CLONE_NEWIPC
-                    | CloneFlags::CLONE_NEWNET,
+            child(
+                cmd,
+                &root_fs,
+                stdout_write,
+                stderr_write,
+                stdout_read,
+                stderr_read,
+                csock_wait_user_namespace,
+                csock_grandchild_pid,
+                csock_wait_cgroups,
             )?;
 
-            match unsafe { fork()? } {
-                ForkResult::Parent { child } => {
-                    println!("GRANDCHILD: {}", child);
-                    send_grandchild_pid(&csock_grandchild_pid, child.as_raw())?;
-                    match waitpid(child, None) {
-                        Ok(status) => {
-                            println!("Child status: {:?}", status);
-                        }
-                        Err(e) => {
-                            println!("Error waiting for child: {:?}", e);
-                        }
-                    }
-                    std::process::exit(0);
-                }
-                ForkResult::Child => {
-                    setup_filesystem(&root_fs)?;
-                    sethostname("coderunner")?;
-                    wait_for_signal(csock_wait_cgroups)?;
-
-                    println!("Executing command: {}", cmd);
-
-                    close(stdout_read)?;
-                    dup2_stdout(&stdout_write)?;
-                    close(stdout_write)?;
-
-                    close(stderr_read)?;
-                    dup2_stderr(&stderr_write)?;
-                    close(stderr_write)?;
-
-                    execute_command(cmd)?;
-                }
-            };
-
-            #[allow(unreachable_code)]
-            Ok(0)
+            unreachable!()
         }
     }
+}
+
+async fn parent<'a, Fd1, Fd2, Fd3, Fd4>(
+    child: Pid,
+    stdout_write: Fd1,
+    stderr_write: Fd2,
+    stdout_read: &Fd3,
+    stderr_read: &Fd4,
+    psock_wait_user_namespace: UnixStream,
+    psock_grandchild_pid: UnixStream,
+    psock_wait_cgroups: UnixStream,
+    limits: &ResourceLimits,
+    systemd_manager: &SystemdManagerProxy<'a>,
+) -> Result<i32, Box<dyn std::error::Error>>
+where
+    Fd1: std::os::fd::IntoRawFd,
+    Fd2: std::os::fd::IntoRawFd,
+    Fd3: std::os::fd::AsFd,
+    Fd4: std::os::fd::AsFd,
+{
+    close(stdout_write)?;
+    close(stderr_write)?;
+
+    // TODO: Make this function async
+    wait_for_signal(psock_wait_user_namespace)?;
+    setup_id_mapping(child.as_raw())?;
+
+    let grandchild_pid = receive_grandchild_pid(psock_grandchild_pid)?;
+    println!("Received grandchild PID: {}", grandchild_pid);
+
+    create_cgroups_scope(
+        grandchild_pid.to_string().as_str(),
+        grandchild_pid,
+        limits,
+        systemd_manager,
+    )
+    .await?;
+    send_signal(&psock_wait_cgroups)?;
+
+    let pidfd = AsyncPidFd::from_pid(child.as_raw())?;
+    let status = pidfd.wait().await?;
+
+    println!("stdout: {:?}", read_from_pipe(stdout_read));
+    println!("stderr: {:?}", read_from_pipe(stderr_read));
+    Ok(status.status().code().unwrap_or(-1))
+}
+
+fn child<Fd1, Fd2, Fd3, Fd4>(
+    cmd: &str,
+    root_fs: &str,
+    stdout_write: Fd1,
+    stderr_write: Fd2,
+    stdout_read: Fd3,
+    stderr_read: Fd4,
+    csock_wait_user_namespace: UnixStream,
+    csock_grandchild_pid: UnixStream,
+    csock_wait_cgroups: UnixStream,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    Fd1: std::os::fd::IntoRawFd + std::os::fd::AsFd,
+    Fd2: std::os::fd::IntoRawFd + std::os::fd::AsFd,
+    Fd3: std::os::fd::IntoRawFd,
+    Fd4: std::os::fd::IntoRawFd,
+{
+    unshare(CloneFlags::CLONE_NEWUSER)?;
+    send_signal(&csock_wait_user_namespace)?;
+    unshare(
+        CloneFlags::CLONE_NEWPID
+            | CloneFlags::CLONE_NEWNS
+            | CloneFlags::CLONE_NEWUTS
+            | CloneFlags::CLONE_NEWIPC
+            | CloneFlags::CLONE_NEWNET,
+    )?;
+
+    match unsafe { fork()? } {
+        ForkResult::Parent { child } => {
+            println!("GRANDCHILD: {}", child);
+            send_grandchild_pid(&csock_grandchild_pid, child.as_raw())?;
+            match waitpid(child, None) {
+                Ok(status) => {
+                    println!("Child status: {:?}", status);
+                }
+                Err(e) => {
+                    println!("Error waiting for child: {:?}", e);
+                }
+            }
+            std::process::exit(0);
+        }
+        ForkResult::Child => {
+            setup_filesystem(&root_fs)?;
+            sethostname("coderunner")?;
+            wait_for_signal(csock_wait_cgroups)?;
+
+            println!("Executing command: {}", cmd);
+
+            close(stdout_read)?;
+            dup2_stdout(&stdout_write)?;
+            close(stdout_write)?;
+
+            close(stderr_read)?;
+            dup2_stderr(&stderr_write)?;
+            close(stderr_write)?;
+
+            execute_command(cmd)?;
+        }
+    };
+
+    Ok(())
 }
 
 async fn create_cgroups_scope<'a>(
