@@ -4,7 +4,10 @@ use std::{
     ffi::CString,
     fs,
     io::{Read, Write},
-    os::unix::net::UnixStream,
+    os::{
+        fd::{FromRawFd, IntoRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     path,
 };
 
@@ -15,8 +18,8 @@ use nix::{
     sched::{CloneFlags, unshare},
     sys::wait::waitpid,
     unistd::{
-        ForkResult, Pid, chdir, close, dup2_stderr, dup2_stdout, execve, fork, getgid, getuid,
-        pipe, pivot_root, read, sethostname,
+        ForkResult, Pid, chdir, dup2_stderr, dup2_stdout, execve, fork, getgid, getuid, pipe,
+        pivot_root, sethostname,
     },
 };
 use tokio::{
@@ -90,12 +93,20 @@ async fn spawn_process<'a>(
             let psock_grandchild_pid = TokioUnixStream::from_std(psock_grandchild_pid)?;
             let psock_wait_cgroups = TokioUnixStream::from_std(psock_wait_cgroups)?;
 
+            let mut stdout_read = tokio::fs::File::from_std(unsafe {
+                std::fs::File::from_raw_fd(stdout_read.into_raw_fd())
+            });
+
+            let mut stderr_read = tokio::fs::File::from_std(unsafe {
+                std::fs::File::from_raw_fd(stderr_read.into_raw_fd())
+            });
+
             parent(
                 child,
                 stdout_write,
                 stderr_write,
-                &stdout_read,
-                &stderr_read,
+                &mut stdout_read,
+                &mut stderr_read,
                 psock_wait_user_namespace,
                 psock_grandchild_pid,
                 psock_wait_cgroups,
@@ -124,26 +135,20 @@ async fn spawn_process<'a>(
     }
 }
 
-async fn parent<'a, Fd1, Fd2, Fd3, Fd4>(
+async fn parent<'a>(
     child: Pid,
-    stdout_write: Fd1,
-    stderr_write: Fd2,
-    stdout_read: &Fd3,
-    stderr_read: &Fd4,
+    stdout_write: OwnedFd,
+    stderr_write: OwnedFd,
+    stdout_read: &mut tokio::fs::File,
+    stderr_read: &mut tokio::fs::File,
     psock_wait_user_namespace: TokioUnixStream,
     psock_grandchild_pid: TokioUnixStream,
     mut psock_wait_cgroups: TokioUnixStream,
     limits: &ResourceLimits,
     systemd_manager: &SystemdManagerProxy<'a>,
-) -> Result<i32, Box<dyn std::error::Error>>
-where
-    Fd1: std::os::fd::IntoRawFd,
-    Fd2: std::os::fd::IntoRawFd,
-    Fd3: std::os::fd::AsFd,
-    Fd4: std::os::fd::AsFd,
-{
-    close(stdout_write)?;
-    close(stderr_write)?;
+) -> Result<i32, Box<dyn std::error::Error>> {
+    drop(stdout_write);
+    drop(stderr_write);
 
     wait_for_signal_async(psock_wait_user_namespace).await?;
     setup_id_mapping(child.as_raw())?;
@@ -163,28 +168,22 @@ where
     let pidfd = AsyncPidFd::from_pid(child.as_raw())?;
     let status = pidfd.wait().await?;
 
-    println!("stdout: {:?}", read_from_pipe(stdout_read));
-    println!("stderr: {:?}", read_from_pipe(stderr_read));
+    println!("stdout: {:?}", read_from_pipe(stdout_read).await);
+    println!("stderr: {:?}", read_from_pipe(stderr_read).await);
     Ok(status.status().code().unwrap_or(-1))
 }
 
-fn child<Fd1, Fd2, Fd3, Fd4>(
+fn child(
     cmd: &str,
     root_fs: &str,
-    stdout_write: Fd1,
-    stderr_write: Fd2,
-    stdout_read: Fd3,
-    stderr_read: Fd4,
+    stdout_write: OwnedFd,
+    stderr_write: OwnedFd,
+    stdout_read: OwnedFd,
+    stderr_read: OwnedFd,
     csock_wait_user_namespace: UnixStream,
     csock_grandchild_pid: UnixStream,
     csock_wait_cgroups: UnixStream,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    Fd1: std::os::fd::IntoRawFd + std::os::fd::AsFd,
-    Fd2: std::os::fd::IntoRawFd + std::os::fd::AsFd,
-    Fd3: std::os::fd::IntoRawFd,
-    Fd4: std::os::fd::IntoRawFd,
-{
+) -> Result<(), Box<dyn std::error::Error>> {
     unshare(CloneFlags::CLONE_NEWUSER)?;
     send_signal_sync(&csock_wait_user_namespace)?;
     unshare(
@@ -216,13 +215,13 @@ where
 
             println!("Executing command: {}", cmd);
 
-            close(stdout_read)?;
+            drop(stdout_read);
             dup2_stdout(&stdout_write)?;
-            close(stdout_write)?;
+            drop(stdout_write);
 
-            close(stderr_read)?;
+            drop(stderr_read);
             dup2_stderr(&stderr_write)?;
-            close(stderr_write)?;
+            drop(stderr_write);
 
             execute_command(cmd)?;
         }
@@ -411,7 +410,6 @@ fn send_grandchild_pid(mut sock: &UnixStream, pid: i32) -> Result<(), Box<dyn st
     Ok(())
 }
 
-// TODO: Create async version
 async fn receive_grandchild_pid(
     mut sock: TokioUnixStream,
 ) -> Result<i32, Box<dyn std::error::Error>> {
@@ -423,10 +421,9 @@ async fn receive_grandchild_pid(
     Ok(pid)
 }
 
-// TODO: Create async version
-fn read_from_pipe<Fd: std::os::fd::AsFd>(pipe: &Fd) -> Option<String> {
-    let mut buffer = [0u8; 1000];
-    match read(pipe, &mut buffer) {
+async fn read_from_pipe(pipe: &mut tokio::fs::File) -> Option<String> {
+    let mut buffer = Vec::new();
+    match pipe.read_to_end(&mut buffer).await {
         Ok(bytes_read) if bytes_read > 0 => {
             Some(String::from_utf8_lossy(&buffer[..bytes_read]).to_string())
         }
