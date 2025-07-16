@@ -151,7 +151,7 @@ async fn parent<'a>(
     drop(stderr_write);
 
     wait_for_signal_async(psock_wait_user_namespace).await?;
-    setup_id_mapping(child.as_raw())?;
+    setup_id_mapping(child.as_raw()).await?;
 
     let grandchild_pid = receive_grandchild_pid(psock_grandchild_pid).await?;
     println!("Received grandchild PID: {}", grandchild_pid);
@@ -300,8 +300,7 @@ async fn create_cgroups_scope<'a>(
     Ok(scope_name)
 }
 
-// TODO: Rewrite to async
-fn setup_id_mapping(child_pid: i32) -> Result<(), Box<dyn std::error::Error>> {
+async fn setup_id_mapping(child_pid: i32) -> Result<(), Box<dyn std::error::Error>> {
     let uid = getuid();
     let gid = getgid();
 
@@ -312,9 +311,13 @@ fn setup_id_mapping(child_pid: i32) -> Result<(), Box<dyn std::error::Error>> {
 
     let uid_map = format!("0 {} 1\n", uid.as_raw());
     let uid_map_path = format!("/proc/{}/uid_map", child_pid);
-    match std::fs::OpenOptions::new().write(true).open(&uid_map_path) {
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&uid_map_path)
+        .await
+    {
         Ok(mut file) => {
-            file.write_all(uid_map.as_bytes())?;
+            file.write_all(uid_map.as_bytes()).await?;
             println!("Parent: UID mapping configured: {}", uid_map.trim());
         }
         Err(e) => {
@@ -324,12 +327,13 @@ fn setup_id_mapping(child_pid: i32) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let setgroups_path = format!("/proc/{}/setgroups", child_pid);
-    match std::fs::OpenOptions::new()
+    match tokio::fs::OpenOptions::new()
         .write(true)
         .open(&setgroups_path)
+        .await
     {
         Ok(mut file) => {
-            file.write_all(b"deny")?;
+            file.write_all(b"deny").await?;
             println!("Parent: setgroups configured");
         }
         Err(e) => {
@@ -340,9 +344,13 @@ fn setup_id_mapping(child_pid: i32) -> Result<(), Box<dyn std::error::Error>> {
 
     let gid_map = format!("0 {} 1\n", gid.as_raw());
     let gid_map_path = format!("/proc/{}/gid_map", child_pid);
-    match std::fs::OpenOptions::new().write(true).open(&gid_map_path) {
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&gid_map_path)
+        .await
+    {
         Ok(mut file) => {
-            file.write_all(gid_map.as_bytes())?;
+            file.write_all(gid_map.as_bytes()).await?;
             println!("Parent: GID mapping configured: {}", gid_map.trim());
         }
         Err(e) => {
