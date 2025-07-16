@@ -398,7 +398,7 @@ async fn main() {
     let limits = &ResourceLimits {
         memory_max: get_mem_max(),
         cpu_quota_per_sec: get_cpu_max(),
-        pids_max: None,
+        pids_max: get_procs_max(),
     };
 
     let zbus_conn = zbus::Connection::session().await.unwrap();
@@ -432,4 +432,8 @@ fn get_cpu_max() -> Option<u64> {
     let cpu_max = env::var("CPU_MAX").ok()?.parse::<u64>().ok()?;
     let threads_count = num_cpus::get();
     Some(MAX_CPU_QUOTA_ONE_THREAD_US * (threads_count as u64) * cpu_max / 100)
+}
+
+fn get_procs_max() -> Option<u64> {
+    env::var("PROCS_MAX").ok()?.parse::<u64>().ok()
 }
