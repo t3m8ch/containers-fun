@@ -19,6 +19,10 @@ use nix::{
         pipe, pivot_root, read, sethostname,
     },
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixStream as TokioUnixStream,
+};
 use zbus::{
     proxy,
     zvariant::{OwnedObjectPath, Value},
@@ -78,6 +82,14 @@ async fn spawn_process<'a>(
         ForkResult::Parent { child } => {
             println!("It's parent. Child pid: {}", child);
 
+            psock_wait_user_namespace.set_nonblocking(true)?;
+            psock_grandchild_pid.set_nonblocking(true)?;
+            psock_wait_cgroups.set_nonblocking(true)?;
+
+            let psock_wait_user_namespace = TokioUnixStream::from_std(psock_wait_user_namespace)?;
+            let psock_grandchild_pid = TokioUnixStream::from_std(psock_grandchild_pid)?;
+            let psock_wait_cgroups = TokioUnixStream::from_std(psock_wait_cgroups)?;
+
             parent(
                 child,
                 stdout_write,
@@ -118,9 +130,9 @@ async fn parent<'a, Fd1, Fd2, Fd3, Fd4>(
     stderr_write: Fd2,
     stdout_read: &Fd3,
     stderr_read: &Fd4,
-    psock_wait_user_namespace: UnixStream,
-    psock_grandchild_pid: UnixStream,
-    psock_wait_cgroups: UnixStream,
+    psock_wait_user_namespace: TokioUnixStream,
+    psock_grandchild_pid: TokioUnixStream,
+    mut psock_wait_cgroups: TokioUnixStream,
     limits: &ResourceLimits,
     systemd_manager: &SystemdManagerProxy<'a>,
 ) -> Result<i32, Box<dyn std::error::Error>>
@@ -133,11 +145,10 @@ where
     close(stdout_write)?;
     close(stderr_write)?;
 
-    // TODO: Make this function async
-    wait_for_signal(psock_wait_user_namespace)?;
+    wait_for_signal_async(psock_wait_user_namespace).await?;
     setup_id_mapping(child.as_raw())?;
 
-    let grandchild_pid = receive_grandchild_pid(psock_grandchild_pid)?;
+    let grandchild_pid = receive_grandchild_pid(psock_grandchild_pid).await?;
     println!("Received grandchild PID: {}", grandchild_pid);
 
     create_cgroups_scope(
@@ -147,7 +158,7 @@ where
         systemd_manager,
     )
     .await?;
-    send_signal(&psock_wait_cgroups)?;
+    send_signal_async(&mut psock_wait_cgroups).await?;
 
     let pidfd = AsyncPidFd::from_pid(child.as_raw())?;
     let status = pidfd.wait().await?;
@@ -175,7 +186,7 @@ where
     Fd4: std::os::fd::IntoRawFd,
 {
     unshare(CloneFlags::CLONE_NEWUSER)?;
-    send_signal(&csock_wait_user_namespace)?;
+    send_signal_sync(&csock_wait_user_namespace)?;
     unshare(
         CloneFlags::CLONE_NEWPID
             | CloneFlags::CLONE_NEWNS
@@ -201,7 +212,7 @@ where
         ForkResult::Child => {
             setup_filesystem(&root_fs)?;
             sethostname("coderunner")?;
-            wait_for_signal(csock_wait_cgroups)?;
+            wait_for_signal_sync(csock_wait_cgroups)?;
 
             println!("Executing command: {}", cmd);
 
@@ -290,6 +301,7 @@ async fn create_cgroups_scope<'a>(
     Ok(scope_name)
 }
 
+// TODO: Rewrite to async
 fn setup_id_mapping(child_pid: i32) -> Result<(), Box<dyn std::error::Error>> {
     let uid = getuid();
     let gid = getgid();
@@ -348,7 +360,7 @@ fn create_sync_channel() -> Result<(UnixStream, UnixStream), Box<dyn std::error:
     Ok((parent_sock, child_sock))
 }
 
-fn wait_for_signal(mut sock: UnixStream) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_signal_sync(mut sock: UnixStream) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0u8; 1];
     sock.set_read_timeout(None)?;
     match sock.read_exact(&mut buf) {
@@ -363,8 +375,31 @@ fn wait_for_signal(mut sock: UnixStream) -> Result<(), Box<dyn std::error::Error
     }
 }
 
-fn send_signal(mut sock: &UnixStream) -> Result<(), Box<dyn std::error::Error>> {
+async fn wait_for_signal_async(
+    mut sock: TokioUnixStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = [0u8; 1];
+    // sock.set_read_timeout(None)?;
+    match sock.read_exact(&mut buf).await {
+        Ok(_) => {
+            println!("Received signal from, continuing...");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error reading: {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+fn send_signal_sync(mut sock: &UnixStream) -> Result<(), Box<dyn std::error::Error>> {
     sock.write_all(&[1])?;
+    println!("Signal sent");
+    Ok(())
+}
+
+async fn send_signal_async(sock: &mut TokioUnixStream) -> Result<(), Box<dyn std::error::Error>> {
+    sock.write_all(&[1]).await?;
     println!("Signal sent");
     Ok(())
 }
@@ -376,15 +411,19 @@ fn send_grandchild_pid(mut sock: &UnixStream, pid: i32) -> Result<(), Box<dyn st
     Ok(())
 }
 
-fn receive_grandchild_pid(mut sock: UnixStream) -> Result<i32, Box<dyn std::error::Error>> {
+// TODO: Create async version
+async fn receive_grandchild_pid(
+    mut sock: TokioUnixStream,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let mut buf = [0u8; 4]; // i32 = 4 bytes
-    sock.set_read_timeout(None)?;
-    sock.read_exact(&mut buf)?;
+    // sock.set_read_timeout(None)?;
+    sock.read_exact(&mut buf).await?;
     let pid = i32::from_le_bytes(buf);
     println!("Received grandchild PID: {}", pid);
     Ok(pid)
 }
 
+// TODO: Create async version
 fn read_from_pipe<Fd: std::os::fd::AsFd>(pipe: &Fd) -> Option<String> {
     let mut buffer = [0u8; 1000];
     match read(pipe, &mut buffer) {
