@@ -21,6 +21,7 @@ use zbus::{
     zvariant::{OwnedObjectPath, Value},
 };
 
+#[derive(Clone, Debug)]
 pub struct ResourceLimits {
     pub memory_max: Option<u64>,        // в байтах
     pub cpu_quota_per_sec: Option<u64>, // в микросекундах
@@ -56,7 +57,7 @@ trait SystemdManager {
 async fn spawn_process<'a>(
     cmd: &str,
     root_fs: &str,
-    mem_max: Option<u64>,
+    limits: &ResourceLimits,
     systemd_manager: &SystemdManagerProxy<'a>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let root_fs = path::absolute(root_fs)?
@@ -82,11 +83,7 @@ async fn spawn_process<'a>(
             create_cgroups_scope(
                 grandchild_pid.to_string().as_str(),
                 grandchild_pid,
-                &ResourceLimits {
-                    memory_max: mem_max,
-                    cpu_quota_per_sec: None,
-                    pids_max: None,
-                },
+                limits,
                 systemd_manager,
             )
             .await?;
@@ -398,12 +395,16 @@ fn execute_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() {
     let cmd = env::args().skip(1).join(" ");
-    let mem_max = get_mem_max();
+    let limits = &ResourceLimits {
+        memory_max: get_mem_max(),
+        cpu_quota_per_sec: get_cpu_max(),
+        pids_max: None,
+    };
 
     let zbus_conn = zbus::Connection::session().await.unwrap();
     let systemd_manager = SystemdManagerProxy::new(&zbus_conn).await.unwrap();
 
-    spawn_process(&cmd, "./rootfs", mem_max, &systemd_manager)
+    spawn_process(&cmd, "./rootfs", &limits, &systemd_manager)
         .await
         .unwrap();
 }
@@ -424,4 +425,11 @@ fn get_mem_max() -> Option<u64> {
     };
 
     Some(mem_max.parse::<u64>().ok()? * multiplier)
+}
+
+fn get_cpu_max() -> Option<u64> {
+    const MAX_CPU_QUOTA_ONE_THREAD_US: u64 = 1_000_000;
+    let cpu_max = env::var("CPU_MAX").ok()?.parse::<u64>().ok()?;
+    let threads_count = num_cpus::get();
+    Some(MAX_CPU_QUOTA_ONE_THREAD_US * (threads_count as u64) * cpu_max / 100)
 }
