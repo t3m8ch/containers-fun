@@ -14,7 +14,10 @@ use nix::{
     mount::{MntFlags, MsFlags, mount, umount2},
     sched::{CloneFlags, unshare},
     sys::wait::waitpid,
-    unistd::{ForkResult, chdir, execve, fork, getgid, getuid, pivot_root, sethostname},
+    unistd::{
+        ForkResult, chdir, close, dup2_stderr, dup2_stdout, execve, fork, getgid, getuid, pipe,
+        pivot_root, read, sethostname,
+    },
 };
 use zbus::{
     proxy,
@@ -68,10 +71,15 @@ async fn spawn_process<'a>(
     let (psock_wait_user_namespace, csock_wait_user_namespace) = create_sync_channel()?;
     let (psock_wait_cgroups, csock_wait_cgroups) = create_sync_channel()?;
     let (psock_grandchild_pid, csock_grandchild_pid) = create_sync_channel()?;
+    let (stdout_read, stdout_write) = pipe()?;
+    let (stderr_read, stderr_write) = pipe()?;
 
     match unsafe { fork()? } {
         ForkResult::Parent { child } => {
             println!("It's parent. Child pid: {}", child);
+
+            close(stdout_write)?;
+            close(stderr_write)?;
 
             // TODO: Make this function async
             wait_for_signal(psock_wait_user_namespace)?;
@@ -91,6 +99,9 @@ async fn spawn_process<'a>(
 
             let pidfd = AsyncPidFd::from_pid(child.as_raw())?;
             let status = pidfd.wait().await?;
+
+            println!("stdout: {:?}", read_from_pipe(&stdout_read));
+            println!("stderr: {:?}", read_from_pipe(&stderr_read));
             Ok(status.status().code().unwrap_or(-1))
         }
         ForkResult::Child => {
@@ -123,8 +134,18 @@ async fn spawn_process<'a>(
                 ForkResult::Child => {
                     setup_filesystem(&root_fs)?;
                     sethostname("coderunner")?;
-
                     wait_for_signal(csock_wait_cgroups)?;
+
+                    println!("Executing command: {}", cmd);
+
+                    close(stdout_read)?;
+                    dup2_stdout(&stdout_write)?;
+                    close(stdout_write)?;
+
+                    close(stderr_read)?;
+                    dup2_stderr(&stderr_write)?;
+                    close(stderr_write)?;
+
                     execute_command(cmd)?;
                 }
             };
@@ -300,6 +321,16 @@ fn receive_grandchild_pid(mut sock: UnixStream) -> Result<i32, Box<dyn std::erro
     Ok(pid)
 }
 
+fn read_from_pipe<Fd: std::os::fd::AsFd>(pipe: &Fd) -> Option<String> {
+    let mut buffer = [0u8; 1000];
+    match read(pipe, &mut buffer) {
+        Ok(bytes_read) if bytes_read > 0 => {
+            Some(String::from_utf8_lossy(&buffer[..bytes_read]).to_string())
+        }
+        _ => None,
+    }
+}
+
 fn setup_filesystem(root_fs: &str) -> Result<(), Box<dyn std::error::Error>> {
     let dirs = ["proc", "sys", "dev", "tmp"];
     for dir in &dirs {
@@ -387,7 +418,6 @@ fn execute_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
         CString::new("USER=root")?,
     ];
 
-    println!("Executing command: {}", cmd);
     execve(&program, &args, &env)?;
     Ok(())
 }
