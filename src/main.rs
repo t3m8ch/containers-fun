@@ -398,9 +398,7 @@ fn execute_command(cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() {
     let cmd = env::args().skip(1).join(" ");
-    let mem_max = env::var("MEM_MAX")
-        .map(|m| str::parse::<u64>(&m).unwrap())
-        .ok();
+    let mem_max = get_mem_max();
 
     let zbus_conn = zbus::Connection::session().await.unwrap();
     let systemd_manager = SystemdManagerProxy::new(&zbus_conn).await.unwrap();
@@ -408,4 +406,22 @@ async fn main() {
     spawn_process(&cmd, "./rootfs", mem_max, &systemd_manager)
         .await
         .unwrap();
+}
+
+fn get_mem_max() -> Option<u64> {
+    let mut mem_max = env::var("MEM_MAX").ok()?;
+    let last_char = mem_max.pop()?.to_ascii_uppercase();
+
+    let multiplier = match last_char {
+        'K' => 1024,
+        'M' => 1024 * 1024,
+        'G' => 1024 * 1024 * 1024,
+        '0'..='9' => {
+            mem_max.push(last_char);
+            1
+        }
+        _ => 1,
+    };
+
+    Some(mem_max.parse::<u64>().ok()? * multiplier)
 }
